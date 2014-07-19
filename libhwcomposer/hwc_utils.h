@@ -125,9 +125,10 @@ struct ListStats {
     // Notifies hwcomposer about the start and end of animation
     // This will be set to true during animation, otherwise false.
     bool isDisplayAnimating;
-    ovutils::Dim roi;
     bool secureUI; // Secure display layer
     bool isSecurePresent;
+    hwc_rect_t lRoi;  //left ROI
+    hwc_rect_t rRoi;  //right ROI. Unused in single DSI panels.
 };
 
 //PTOR Comp info
@@ -240,11 +241,6 @@ inline bool isNonIntegralSourceCrop(const hwc_frect_t& cropF) {
 // -----------------------------------------------------------------------------
 // Utility functions - implemented in hwc_utils.cpp
 void dumpLayer(hwc_layer_1_t const* l);
-
-// Calculate viewframe for external/primary display from primary resolution and
-// primary device orientation
-hwc_rect_t calculateDisplayViewFrame(hwc_context_t *ctx, int dpy);
-
 void setListStats(hwc_context_t *ctx, hwc_display_contents_1_t *list,
         int dpy);
 void initContext(hwc_context_t *ctx);
@@ -316,8 +312,11 @@ int getMirrorModeOrientation(hwc_context_t *ctx);
 /* Get External State names */
 const char* getExternalDisplayState(uint32_t external_state);
 
+// Resets display ROI to full panel resoluion
+void resetROI(hwc_context_t *ctx, const int dpy);
+
 // Aligns updating ROI to panel restrictions
-hwc_rect_t sanitizeROI(struct hwc_rect roi, hwc_rect boundary);
+hwc_rect_t getSanitizeROI(struct hwc_rect roi, hwc_rect boundary);
 
 // Handles wfd Pause and resume events
 void handle_pause(hwc_context_t *ctx, int dpy);
