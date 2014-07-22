@@ -959,6 +959,32 @@ bool isSecureModePolicy(int mdpVersion) {
         return false;
 }
 
+bool isRotatorSupportedFormat(private_handle_t *hnd) {
+    // Following rotator src formats are supported by mdp driver
+    // TODO: Add more formats in future, if mdp driver adds support
+    switch(hnd->format) {
+        case HAL_PIXEL_FORMAT_RGBA_8888:
+        case HAL_PIXEL_FORMAT_RGB_565:
+        case HAL_PIXEL_FORMAT_RGB_888:
+        case HAL_PIXEL_FORMAT_BGRA_8888:
+            return true;
+        default:
+            return false;
+    }
+    return false;
+}
+
+bool isRotationDoable(hwc_context_t *ctx, private_handle_t *hnd) {
+    // Rotate layers, if it is YUV type or rendered by CPU and not
+    // for the MDP versions below MDP5
+    if((isCPURendered(hnd) && isRotatorSupportedFormat(hnd) &&
+        !ctx->mMDP.version < qdutils::MDSS_V5)
+                   || isYuvBuffer(hnd)) {
+        return true;
+    }
+    return false;
+}
+
 // returns true if Action safe dimensions are set and target supports Actionsafe
 bool isActionSafePresent(hwc_context_t *ctx, int dpy) {
     // if external supports underscan, do nothing
@@ -1415,7 +1441,7 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
     return ret;
 }
 
-void setMdpFlags(hwc_layer_1_t *layer,
+void setMdpFlags(hwc_context_t *ctx, hwc_layer_1_t *layer,
         ovutils::eMdpFlags &mdpFlags,
         int rotDownscale, int transform) {
     private_handle_t *hnd = (private_handle_t *)layer->handle;
@@ -1436,11 +1462,6 @@ void setMdpFlags(hwc_layer_1_t *layer,
             ovutils::setMdpFlags(mdpFlags,
                     ovutils::OV_MDP_DEINTERLACE);
         }
-        //Pre-rotation will be used using rotator.
-        if(transform & HWC_TRANSFORM_ROT_90) {
-            ovutils::setMdpFlags(mdpFlags,
-                    ovutils::OV_MDP_SOURCE_ROTATED_90);
-        }
     }
 
     if(isSecureDisplayBuffer(hnd)) {
@@ -1449,6 +1470,12 @@ void setMdpFlags(hwc_layer_1_t *layer,
                              ovutils::OV_MDP_SECURE_OVERLAY_SESSION);
         ovutils::setMdpFlags(mdpFlags,
                              ovutils::OV_MDP_SECURE_DISPLAY_OVERLAY_SESSION);
+    }
+
+    //Pre-rotation will be used using rotator.
+    if(has90Transform(layer) && isRotationDoable(ctx, hnd)) {
+        ovutils::setMdpFlags(mdpFlags,
+                ovutils::OV_MDP_SOURCE_ROTATED_90);
     }
     //No 90 component and no rot-downscale then flips done by MDP
     //If we use rot then it might as well do flips
@@ -1484,18 +1511,8 @@ int configRotator(Rotator *rot, Whf& whf,
 
     if (qdutils::MDPVersion::getInstance().getMDPVersion() >=
         qdutils::MDSS_V5) {
-        uint32_t crop_w = (crop.right - crop.left);
-        uint32_t crop_h = (crop.bottom - crop.top);
-        if (ovutils::isYuv(whf.format)) {
-            ovutils::normalizeCrop((uint32_t&)crop.left, crop_w);
-            ovutils::normalizeCrop((uint32_t&)crop.top, crop_h);
-            // For interlaced, crop.h should be 4-aligned
-            if ((mdpFlags & ovutils::OV_MDP_DEINTERLACE) && (crop_h % 4))
-                crop_h = ovutils::aligndown(crop_h, 4);
-            crop.right = crop.left + crop_w;
-            crop.bottom = crop.top + crop_h;
-        }
-        Dim rotCrop(crop.left, crop.top, crop_w, crop_h);
+         Dim rotCrop(crop.left, crop.top, crop.right - crop.left,
+                crop.bottom - crop.top);
         rot->setCrop(rotCrop);
     }
 
@@ -1570,28 +1587,27 @@ int configColorLayer(hwc_context_t *ctx, hwc_layer_1_t *layer,
 }
 
 void updateSource(eTransform& orient, Whf& whf,
-        hwc_rect_t& crop) {
-    Dim srcCrop(crop.left, crop.top,
+        hwc_rect_t& crop, Rotator *rot) {
+    Dim transformedCrop(crop.left, crop.top,
             crop.right - crop.left,
             crop.bottom - crop.top);
-    orient = static_cast<eTransform>(ovutils::getMdpOrient(orient));
-    preRotateSource(orient, whf, srcCrop);
     if (qdutils::MDPVersion::getInstance().getMDPVersion() >=
         qdutils::MDSS_V5) {
-        // Source for overlay will be the cropped (and rotated)
-        crop.left = 0;
-        crop.top = 0;
-        crop.right = srcCrop.w;
-        crop.bottom = srcCrop.h;
-        // Set width & height equal to sourceCrop w & h
-        whf.w = srcCrop.w;
-        whf.h = srcCrop.h;
+        //B-family rotator internally could modify destination dimensions if
+        //downscaling is supported
+        whf = rot->getDstWhf();
+        transformedCrop = rot->getDstDimensions();
     } else {
-        crop.left = srcCrop.x;
-        crop.top = srcCrop.y;
-        crop.right = srcCrop.x + srcCrop.w;
-        crop.bottom = srcCrop.y + srcCrop.h;
+        //A-family rotator rotates entire buffer irrespective of crop, forcing
+        //us to recompute the crop based on transform
+        orient = static_cast<eTransform>(ovutils::getMdpOrient(orient));
+        preRotateSource(orient, whf, transformedCrop);
     }
+
+    crop.left = transformedCrop.x;
+    crop.top = transformedCrop.y;
+    crop.right = transformedCrop.x + transformedCrop.w;
+    crop.bottom = transformedCrop.y + transformedCrop.h;
 }
 
 int configureNonSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
@@ -1642,22 +1658,22 @@ int configureNonSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
         }
     }
 
-    setMdpFlags(layer, mdpFlags, downscale, transform);
+    setMdpFlags(ctx, layer, mdpFlags, downscale, transform);
 
-    if(isYuvBuffer(hnd) && //if 90 component or downscale, use rot
-            ((transform & HWC_TRANSFORM_ROT_90) || downscale)) {
+    //if 90 component or downscale, use rot
+    if((has90Transform(layer) && isRotationDoable(ctx, hnd)) || downscale) {
         *rot = ctx->mRotMgr->getNext();
         if(*rot == NULL) return -1;
         ctx->mLayerRotMap[dpy]->add(layer, *rot);
-        if(!dpy)
+        // BWC is not tested for other formats So enable it only for YUV format
+        if(!dpy && isYuvBuffer(hnd))
             BwcPM::setBwc(crop, dst, transform, mdpFlags);
         //Configure rotator for pre-rotation
         if(configRotator(*rot, whf, crop, mdpFlags, orient, downscale) < 0) {
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        whf.format = (*rot)->getDstFormat();
-        updateSource(orient, whf, crop);
+        updateSource(orient, whf, crop, *rot);
         rotFlags |= ovutils::ROT_PREROTATED;
     }
 
@@ -1739,7 +1755,7 @@ int configureSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
        ActionSafe, and extorientation features. */
     calcExtDisplayPosition(ctx, hnd, dpy, crop, dst, transform, orient);
 
-    setMdpFlags(layer, mdpFlagsL, 0, transform);
+    setMdpFlags(ctx, layer, mdpFlagsL, 0, transform);
 
     if(lDest != OV_INVALID && rDest != OV_INVALID) {
         //Enable overfetch
@@ -1753,7 +1769,7 @@ int configureSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
         whf.format = wb->getOutputFormat();
     }
 
-    if(isYuvBuffer(hnd) && (transform & HWC_TRANSFORM_ROT_90)) {
+    if(has90Transform(layer) && isRotationDoable(ctx, hnd)) {
         (*rot) = ctx->mRotMgr->getNext();
         if((*rot) == NULL) return -1;
         ctx->mLayerRotMap[dpy]->add(layer, *rot);
@@ -1762,8 +1778,7 @@ int configureSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        whf.format = (*rot)->getDstFormat();
-        updateSource(orient, whf, crop);
+        updateSource(orient, whf, crop, *rot);
         rotFlags |= ROT_PREROTATED;
     }
 
@@ -1775,14 +1790,17 @@ int configureSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
 
     const int lSplit = getLeftSplit(ctx, dpy);
 
-    if(lDest != OV_INVALID) {
+    // Calculate Left rects
+    if(dst.left < lSplit) {
         tmp_cropL = crop;
         tmp_dstL = dst;
         hwc_rect_t scissor = {0, 0, lSplit, hw_h };
         scissor = getIntersection(ctx->mViewFrame[dpy], scissor);
         qhwc::calculate_crop_rects(tmp_cropL, tmp_dstL, scissor, 0);
     }
-    if(rDest != OV_INVALID) {
+
+    // Calculate Right rects
+    if(dst.right > lSplit) {
         tmp_cropR = crop;
         tmp_dstR = dst;
         hwc_rect_t scissor = {lSplit, 0, hw_w, hw_h };
@@ -1795,8 +1813,8 @@ int configureSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
     //When buffer is H-flipped, contents of mixer config also needs to swapped
     //Not needed if the layer is confined to one half of the screen.
     //If rotator has been used then it has also done the flips, so ignore them.
-    if((orient & OVERLAY_TRANSFORM_FLIP_H) && lDest != OV_INVALID
-            && rDest != OV_INVALID && (*rot) == NULL) {
+    if((orient & OVERLAY_TRANSFORM_FLIP_H) && (dst.left < lSplit) &&
+            (dst.right > lSplit) && (*rot) == NULL) {
         hwc_rect_t new_cropR;
         new_cropR.left = tmp_cropL.left;
         new_cropR.right = new_cropR.left + (tmp_cropR.right - tmp_cropR.left);
@@ -1878,22 +1896,22 @@ int configureSourceSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
        ActionSafe, and extorientation features. */
     calcExtDisplayPosition(ctx, hnd, dpy, crop, dst, transform, orient);
 
-    setMdpFlags(layer, mdpFlagsL, 0, transform);
+    setMdpFlags(ctx, layer, mdpFlagsL, 0, transform);
     trimLayer(ctx, dpy, transform, crop, dst);
 
-    if(isYuvBuffer(hnd) && (transform & HWC_TRANSFORM_ROT_90)) {
+    if(has90Transform(layer) && isRotationDoable(ctx, hnd)) {
         (*rot) = ctx->mRotMgr->getNext();
         if((*rot) == NULL) return -1;
         ctx->mLayerRotMap[dpy]->add(layer, *rot);
-        if(!dpy)
+        // BWC is not tested for other formats So enable it only for YUV format
+        if(!dpy && isYuvBuffer(hnd))
             BwcPM::setBwc(crop, dst, transform, mdpFlagsL);
         //Configure rotator for pre-rotation
         if(configRotator(*rot, whf, crop, mdpFlagsL, orient, downscale) < 0) {
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        whf.format = (*rot)->getDstFormat();
-        updateSource(orient, whf, crop);
+        updateSource(orient, whf, crop, *rot);
         rotFlags |= ROT_PREROTATED;
     }
 
@@ -2141,30 +2159,23 @@ void BwcPM::setBwc(const hwc_rect_t& crop,
     if(!qdutils::MDPVersion::getInstance().supportsBWC()) {
         return;
     }
+    int src_w = crop.right - crop.left;
+    int src_h = crop.bottom - crop.top;
+    int dst_w = dst.right - dst.left;
+    int dst_h = dst.bottom - dst.top;
+    if(transform & HAL_TRANSFORM_ROT_90) {
+        swap(src_w, src_h);
+    }
     //src width > MAX mixer supported dim
-    if((crop.right - crop.left) > qdutils::MAX_DISPLAY_DIM) {
+    if(src_w > qdutils::MAX_DISPLAY_DIM) {
         return;
     }
     //Decimation necessary, cannot use BWC. H/W requirement.
     if(qdutils::MDPVersion::getInstance().supportsDecimation()) {
-        int src_w = crop.right - crop.left;
-        int src_h = crop.bottom - crop.top;
-        int dst_w = dst.right - dst.left;
-        int dst_h = dst.bottom - dst.top;
-        if(transform & HAL_TRANSFORM_ROT_90) {
-            swap(src_w, src_h);
-        }
-        float horDscale = 0.0f;
-        float verDscale = 0.0f;
-        int horzDeci = 0;
-        int vertDeci = 0;
-        ovutils::getDecimationFactor(src_w, src_h, dst_w, dst_h, horDscale,
-                verDscale);
-        //TODO Use log2f once math.h has it
-        if((int)horDscale)
-            horzDeci = (int)(log(horDscale) / log(2));
-        if((int)verDscale)
-            vertDeci = (int)(log(verDscale) / log(2));
+        uint8_t horzDeci = 0;
+        uint8_t vertDeci = 0;
+        ovutils::getDecimationFactor(src_w, src_h, dst_w, dst_h, horzDeci,
+                vertDeci);
         if(horzDeci || vertDeci) return;
     }
     //Property

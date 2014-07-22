@@ -58,7 +58,7 @@ MDPComp* MDPComp::getObject(hwc_context_t *ctx, const int& dpy) {
 
 MDPComp::MDPComp(int dpy):mDpy(dpy){};
 
-void MDPComp::dump(android::String8& buf)
+void MDPComp::dump(android::String8& buf, hwc_context_t *ctx)
 {
     if(mCurrentFrame.layerCount > MAX_NUM_APP_LAYERS)
         return;
@@ -72,6 +72,21 @@ void MDPComp::dump(android::String8& buf)
     dumpsys_log(buf,"needsFBRedraw:%3s  pipesUsed:%2d  MaxPipesPerMixer: %d \n",
                 (mCurrentFrame.needsRedraw? "YES" : "NO"),
                 mCurrentFrame.mdpCount, sMaxPipesPerMixer);
+    if(isDisplaySplit(ctx, mDpy)) {
+        dumpsys_log(buf, "Programmed ROI's: Left: [%d, %d, %d, %d] "
+                "Right: [%d, %d, %d, %d] \n",
+                ctx->listStats[mDpy].lRoi.left, ctx->listStats[mDpy].lRoi.top,
+                ctx->listStats[mDpy].lRoi.right,
+                ctx->listStats[mDpy].lRoi.bottom,
+                ctx->listStats[mDpy].rRoi.left,ctx->listStats[mDpy].rRoi.top,
+                ctx->listStats[mDpy].rRoi.right,
+                ctx->listStats[mDpy].rRoi.bottom);
+    } else {
+        dumpsys_log(buf, "Programmed ROI: [%d, %d, %d, %d] \n",
+                ctx->listStats[mDpy].lRoi.left,ctx->listStats[mDpy].lRoi.top,
+                ctx->listStats[mDpy].lRoi.right,
+                ctx->listStats[mDpy].lRoi.bottom);
+    }
     dumpsys_log(buf," ---------------------------------------------  \n");
     dumpsys_log(buf," listIdx | cached? | mdpIndex | comptype  |  Z  \n");
     dumpsys_log(buf," ---------------------------------------------  \n");
@@ -303,7 +318,7 @@ bool MDPComp::LayerCache::isSameFrame(const FrameInfo& curFrame,
 
 bool MDPComp::isSupportedForMDPComp(hwc_context_t *ctx, hwc_layer_1_t* layer) {
     private_handle_t *hnd = (private_handle_t *)layer->handle;
-    if((not isYuvBuffer(hnd) and has90Transform(layer)) or
+    if((has90Transform(layer) and (not isRotationDoable(ctx, hnd))) ||
         (not isValidDimension(ctx,layer))
         //More conditions here, SKIP, sRGB+Blend etc
         ) {
@@ -330,7 +345,7 @@ bool MDPComp::isValidDimension(hwc_context_t *ctx, hwc_layer_1_t *layer) {
 
     hwc_rect_t crop = integerizeSourceCrop(layer->sourceCropf);
     hwc_rect_t dst = layer->displayFrame;
-    bool rotated90 = (bool)layer->transform & HAL_TRANSFORM_ROT_90;
+    bool rotated90 = (bool)(layer->transform & HAL_TRANSFORM_ROT_90);
     int crop_w = rotated90 ? crop.bottom - crop.top : crop.right - crop.left;
     int crop_h = rotated90 ? crop.right - crop.left : crop.bottom - crop.top;
     int dst_w = dst.right - dst.left;
@@ -598,8 +613,9 @@ void MDPCompSplit::generateROI(hwc_context_t *ctx,
 
     for(int index = 0; index < numAppLayers; index++ ) {
         hwc_layer_1_t* layer = &list->hwLayers[index];
+        private_handle_t *hnd = (private_handle_t *)layer->handle;
         if ((mCachedFrame.hnd[index] != layer->handle) ||
-                isYuvBuffer((private_handle_t *)layer->handle)) {
+                isYuvBuffer(hnd)) {
             hwc_rect_t dst = layer->displayFrame;
             hwc_rect_t updatingRect = dst;
 
@@ -696,7 +712,7 @@ bool MDPComp::tryFullFrame(hwc_context_t *ctx,
         hwc_layer_1_t* layer = &list->hwLayers[i];
         private_handle_t *hnd = (private_handle_t *)layer->handle;
 
-        if(isYuvBuffer(hnd) && has90Transform(layer)) {
+        if(has90Transform(layer) && isRotationDoable(ctx, hnd)) {
             if(!canUseRotator(ctx, mDpy)) {
                 ALOGD_IF(isDebug(), "%s: Can't use rotator for dpy %d",
                         __FUNCTION__, mDpy);
@@ -1162,7 +1178,7 @@ bool MDPComp::isYUVDoable(hwc_context_t* ctx, hwc_layer_1_t* layer) {
         return false;
     }
 
-    if(layer->transform & HWC_TRANSFORM_ROT_90 && !canUseRotator(ctx,mDpy)) {
+    if(has90Transform(layer) && !canUseRotator(ctx, mDpy)) {
         ALOGD_IF(isDebug(), "%s: no free DMA pipe",__FUNCTION__);
         return false;
     }
@@ -1425,7 +1441,7 @@ bool MDPComp::postHeuristicsHandling(hwc_context_t *ctx,
         hwc_display_contents_1_t* list) {
 
     //Capability checks
-    if(!resourceCheck()) {
+    if(!resourceCheck(ctx, list)) {
         ALOGD_IF(isDebug(), "%s: resource check failed", __FUNCTION__);
         return false;
     }
@@ -1499,10 +1515,29 @@ bool MDPComp::postHeuristicsHandling(hwc_context_t *ctx,
     return true;
 }
 
-bool MDPComp::resourceCheck() {
+bool MDPComp::resourceCheck(hwc_context_t* ctx,
+        hwc_display_contents_1_t* list) {
     const bool fbUsed = mCurrentFrame.fbCount;
     if(mCurrentFrame.mdpCount > sMaxPipesPerMixer - fbUsed) {
         ALOGD_IF(isDebug(), "%s: Exceeds MAX_PIPES_PER_MIXER",__FUNCTION__);
+        return false;
+    }
+    // Init rotCount to number of rotate sessions used by other displays
+    int rotCount = ctx->mRotMgr->getNumActiveSessions();
+    // Count the number of rotator sessions required for current display
+    for (int index = 0; index < mCurrentFrame.layerCount; index++) {
+        if(!mCurrentFrame.isFBComposed[index]) {
+            hwc_layer_1_t* layer = &list->hwLayers[index];
+            private_handle_t *hnd = (private_handle_t *)layer->handle;
+            if(has90Transform(layer) && isRotationDoable(ctx, hnd)) {
+                rotCount++;
+            }
+        }
+    }
+    // if number of layers to rotate exceeds max rotator sessions, bail out.
+    if(rotCount > RotMgr::MAX_ROT_SESS) {
+        ALOGD_IF(isDebug(), "%s: Exceeds max rotator sessions  %d",
+                                    __FUNCTION__, mDpy);
         return false;
     }
     return true;
@@ -1618,7 +1653,7 @@ int MDPComp::prepare(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
         ALOGD("GEOMETRY change: %d",
                 (list->flags & HWC_GEOMETRY_CHANGED));
         android::String8 sDump("");
-        dump(sDump);
+        dump(sDump, ctx);
         ALOGD("%s",sDump.string());
     }
 
@@ -1673,22 +1708,29 @@ int MDPComp::drawOverlap(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
 //=============MDPCompNonSplit==================================================
 
 void MDPCompNonSplit::adjustForSourceSplit(hwc_context_t *ctx,
-        hwc_display_contents_1_t*) {
-    //As we split 4kx2k yuv layer and program to 2 VG pipes
-    //(if available) increase mdpcount accordingly
-    mCurrentFrame.mdpCount += ctx->listStats[mDpy].yuv4k2kCount;
-
+        hwc_display_contents_1_t* list) {
     //If 4k2k Yuv layer split is possible,  and if
     //fbz is above 4k2k layer, increment fb zorder by 1
     //as we split 4k2k layer and increment zorder for right half
     //of the layer
     if(mCurrentFrame.fbZ >= 0) {
-        int n4k2kYuvCount = ctx->listStats[mDpy].yuv4k2kCount;
-        for(int index = 0; index < n4k2kYuvCount; index++){
-            int n4k2kYuvIndex =
-                    ctx->listStats[mDpy].yuv4k2kIndices[index];
-            if(mCurrentFrame.fbZ >= n4k2kYuvIndex){
-                mCurrentFrame.fbZ += 1;
+        for (int index = 0, mdpNextZOrder = 0; index < mCurrentFrame.layerCount;
+                index++) {
+            if(!mCurrentFrame.isFBComposed[index]) {
+                if(mdpNextZOrder == mCurrentFrame.fbZ) {
+                    mdpNextZOrder++;
+                }
+                mdpNextZOrder++;
+                hwc_layer_1_t* layer = &list->hwLayers[index];
+                private_handle_t *hnd = (private_handle_t *)layer->handle;
+                if(is4kx2kYuvBuffer(hnd)) {
+                    if(mdpNextZOrder <= mCurrentFrame.fbZ)
+                        mCurrentFrame.fbZ += 1;
+                    mdpNextZOrder++;
+                    //As we split 4kx2k yuv layer and program to 2 VG pipes
+                    //(if available) increase mdpcount by 1.
+                    mCurrentFrame.mdpCount++;
+                }
             }
         }
     }
@@ -1890,17 +1932,27 @@ void MDPCompSplit::adjustForSourceSplit(hwc_context_t *ctx,
          hwc_display_contents_1_t* list){
     //if 4kx2k yuv layer is totally present in either in left half
     //or right half then try splitting the yuv layer to avoid decimation
-    int n4k2kYuvCount = ctx->listStats[mDpy].yuv4k2kCount;
     const int lSplit = getLeftSplit(ctx, mDpy);
-    for(int index = 0; index < n4k2kYuvCount; index++){
-        int n4k2kYuvIndex = ctx->listStats[mDpy].yuv4k2kIndices[index];
-        hwc_layer_1_t* layer = &list->hwLayers[n4k2kYuvIndex];
-        hwc_rect_t dst = layer->displayFrame;
-        if((dst.left > lSplit) || (dst.right < lSplit)) {
-            mCurrentFrame.mdpCount += 1;
-        }
-        if(mCurrentFrame.fbZ >= n4k2kYuvIndex){
-            mCurrentFrame.fbZ += 1;
+    if(mCurrentFrame.fbZ >= 0) {
+        for (int index = 0, mdpNextZOrder = 0; index < mCurrentFrame.layerCount;
+                index++) {
+            if(!mCurrentFrame.isFBComposed[index]) {
+                if(mdpNextZOrder == mCurrentFrame.fbZ) {
+                    mdpNextZOrder++;
+                }
+                mdpNextZOrder++;
+                hwc_layer_1_t* layer = &list->hwLayers[index];
+                private_handle_t *hnd = (private_handle_t *)layer->handle;
+                if(is4kx2kYuvBuffer(hnd)) {
+                    hwc_rect_t dst = layer->displayFrame;
+                    if((dst.left > lSplit) || (dst.right < lSplit)) {
+                        mCurrentFrame.mdpCount += 1;
+                    }
+                    if(mdpNextZOrder <= mCurrentFrame.fbZ)
+                        mCurrentFrame.fbZ += 1;
+                    mdpNextZOrder++;
+                }
+            }
         }
     }
 }
@@ -2169,9 +2221,23 @@ bool MDPCompSrcSplit::acquireMDPPipes(hwc_context_t *ctx, hwc_layer_1_t* layer,
         return false;
     }
 
-    //If layer's crop width or dest width > 2048, use 2 pipes
-    if((dst.right - dst.left) > qdutils::MAX_DISPLAY_DIM or
-            (crop.right - crop.left) > qdutils::MAX_DISPLAY_DIM) {
+    /* Use 2 pipes IF
+        a) Layer's crop width is > 2048 or
+        b) Layer's dest width > 2048 or
+        c) On primary, driver has indicated with caps to split always. This is
+           based on an empirically derived value of panel height. Applied only
+           if the layer's width is > mixer's width
+    */
+
+    bool primarySplitAlways = (mDpy == HWC_DISPLAY_PRIMARY) and
+            qdutils::MDPVersion::getInstance().isSrcSplitAlways();
+    int lSplit = getLeftSplit(ctx, mDpy);
+    int dstWidth = dst.right - dst.left;
+    int cropWidth = crop.right - crop.left;
+
+    if(dstWidth > qdutils::MAX_DISPLAY_DIM or
+            cropWidth > qdutils::MAX_DISPLAY_DIM or
+            (primarySplitAlways and (cropWidth > lSplit))) {
         pipe_info.rIndex = ctx->mOverlay->getPipe(pipeSpecs);
         if(pipe_info.rIndex == ovutils::OV_INVALID) {
             return false;
@@ -2226,14 +2292,14 @@ int MDPCompSrcSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
     }
 
     eMdpFlags mdpFlags = OV_MDP_BACKEND_COMPOSITION;
-    setMdpFlags(layer, mdpFlags, 0, transform);
+    setMdpFlags(ctx, layer, mdpFlags, 0, transform);
 
     if(lDest != OV_INVALID && rDest != OV_INVALID) {
         //Enable overfetch
         setMdpFlags(mdpFlags, OV_MDSS_MDP_DUAL_PIPE);
     }
 
-    if(isYuvBuffer(hnd) && (transform & HWC_TRANSFORM_ROT_90)) {
+    if(has90Transform(layer) && isRotationDoable(ctx, hnd)) {
         (*rot) = ctx->mRotMgr->getNext();
         if((*rot) == NULL) return -1;
         ctx->mLayerRotMap[mDpy]->add(layer, *rot);
@@ -2246,8 +2312,7 @@ int MDPCompSrcSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        whf.format = (*rot)->getDstFormat();
-        updateSource(orient, whf, crop);
+        updateSource(orient, whf, crop, *rot);
         rotFlags |= ROT_PREROTATED;
     }
 

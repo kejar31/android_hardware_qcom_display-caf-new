@@ -46,7 +46,7 @@ public:
     //Reset values
     void reset();
     /* dumpsys */
-    void dump(android::String8& buf);
+    void dump(android::String8& buf, hwc_context_t *ctx);
     bool isGLESOnlyComp() { return (mCurrentFrame.mdpCount == 0); }
     int drawOverlap(hwc_context_t *ctx, hwc_display_contents_1_t* list);
     static MDPComp* getObject(hwc_context_t *ctx, const int& dpy);
@@ -219,7 +219,7 @@ protected:
             hwc_display_contents_1_t* list);
     void reset(hwc_context_t *ctx);
     bool isSupportedForMDPComp(hwc_context_t *ctx, hwc_layer_1_t* layer);
-    bool resourceCheck();
+    bool resourceCheck(hwc_context_t* ctx, hwc_display_contents_1_t* list);
     hwc_rect_t getUpdatingFBRect(hwc_context_t *ctx,
             hwc_display_contents_1_t* list);
     /* checks for conditions to enable partial udpate */
