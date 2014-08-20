@@ -959,32 +959,6 @@ bool isSecureModePolicy(int mdpVersion) {
         return false;
 }
 
-bool isRotatorSupportedFormat(private_handle_t *hnd) {
-    // Following rotator src formats are supported by mdp driver
-    // TODO: Add more formats in future, if mdp driver adds support
-    switch(hnd->format) {
-        case HAL_PIXEL_FORMAT_RGBA_8888:
-        case HAL_PIXEL_FORMAT_RGB_565:
-        case HAL_PIXEL_FORMAT_RGB_888:
-        case HAL_PIXEL_FORMAT_BGRA_8888:
-            return true;
-        default:
-            return false;
-    }
-    return false;
-}
-
-bool isRotationDoable(hwc_context_t *ctx, private_handle_t *hnd) {
-    // Rotate layers, if it is YUV type or rendered by CPU and not
-    // for the MDP versions below MDP5
-    if((isCPURendered(hnd) && isRotatorSupportedFormat(hnd) &&
-        !ctx->mMDP.version < qdutils::MDSS_V5)
-                   || isYuvBuffer(hnd)) {
-        return true;
-    }
-    return false;
-}
-
 // returns true if Action safe dimensions are set and target supports Actionsafe
 bool isActionSafePresent(hwc_context_t *ctx, int dpy) {
     // if external supports underscan, do nothing
@@ -1441,7 +1415,7 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
     return ret;
 }
 
-void setMdpFlags(hwc_context_t *ctx, hwc_layer_1_t *layer,
+void setMdpFlags(hwc_layer_1_t *layer,
         ovutils::eMdpFlags &mdpFlags,
         int rotDownscale, int transform) {
     private_handle_t *hnd = (private_handle_t *)layer->handle;
@@ -1462,6 +1436,11 @@ void setMdpFlags(hwc_context_t *ctx, hwc_layer_1_t *layer,
             ovutils::setMdpFlags(mdpFlags,
                     ovutils::OV_MDP_DEINTERLACE);
         }
+        //Pre-rotation will be used using rotator.
+        if(transform & HWC_TRANSFORM_ROT_90) {
+            ovutils::setMdpFlags(mdpFlags,
+                    ovutils::OV_MDP_SOURCE_ROTATED_90);
+        }
     }
 
     if(isSecureDisplayBuffer(hnd)) {
@@ -1470,12 +1449,6 @@ void setMdpFlags(hwc_context_t *ctx, hwc_layer_1_t *layer,
                              ovutils::OV_MDP_SECURE_OVERLAY_SESSION);
         ovutils::setMdpFlags(mdpFlags,
                              ovutils::OV_MDP_SECURE_DISPLAY_OVERLAY_SESSION);
-    }
-
-    //Pre-rotation will be used using rotator.
-    if(has90Transform(layer) && isRotationDoable(ctx, hnd)) {
-        ovutils::setMdpFlags(mdpFlags,
-                ovutils::OV_MDP_SOURCE_ROTATED_90);
     }
     //No 90 component and no rot-downscale then flips done by MDP
     //If we use rot then it might as well do flips
@@ -1658,15 +1631,14 @@ int configureNonSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
         }
     }
 
-    setMdpFlags(ctx, layer, mdpFlags, downscale, transform);
+    setMdpFlags(layer, mdpFlags, downscale, transform);
 
-    //if 90 component or downscale, use rot
-    if((has90Transform(layer) && isRotationDoable(ctx, hnd)) || downscale) {
+    if(isYuvBuffer(hnd) && //if 90 component or downscale, use rot
+            ((transform & HWC_TRANSFORM_ROT_90) || downscale)) {
         *rot = ctx->mRotMgr->getNext();
         if(*rot == NULL) return -1;
         ctx->mLayerRotMap[dpy]->add(layer, *rot);
-        // BWC is not tested for other formats So enable it only for YUV format
-        if(!dpy && isYuvBuffer(hnd))
+        if(!dpy)
             BwcPM::setBwc(crop, dst, transform, mdpFlags);
         //Configure rotator for pre-rotation
         if(configRotator(*rot, whf, crop, mdpFlags, orient, downscale) < 0) {
@@ -1755,7 +1727,7 @@ int configureSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
        ActionSafe, and extorientation features. */
     calcExtDisplayPosition(ctx, hnd, dpy, crop, dst, transform, orient);
 
-    setMdpFlags(ctx, layer, mdpFlagsL, 0, transform);
+    setMdpFlags(layer, mdpFlagsL, 0, transform);
 
     if(lDest != OV_INVALID && rDest != OV_INVALID) {
         //Enable overfetch
@@ -1769,7 +1741,7 @@ int configureSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
         whf.format = wb->getOutputFormat();
     }
 
-    if(has90Transform(layer) && isRotationDoable(ctx, hnd)) {
+    if(isYuvBuffer(hnd) && (transform & HWC_TRANSFORM_ROT_90)) {
         (*rot) = ctx->mRotMgr->getNext();
         if((*rot) == NULL) return -1;
         ctx->mLayerRotMap[dpy]->add(layer, *rot);
@@ -1896,15 +1868,14 @@ int configureSourceSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
        ActionSafe, and extorientation features. */
     calcExtDisplayPosition(ctx, hnd, dpy, crop, dst, transform, orient);
 
-    setMdpFlags(ctx, layer, mdpFlagsL, 0, transform);
+    setMdpFlags(layer, mdpFlagsL, 0, transform);
     trimLayer(ctx, dpy, transform, crop, dst);
 
-    if(has90Transform(layer) && isRotationDoable(ctx, hnd)) {
+    if(isYuvBuffer(hnd) && (transform & HWC_TRANSFORM_ROT_90)) {
         (*rot) = ctx->mRotMgr->getNext();
         if((*rot) == NULL) return -1;
         ctx->mLayerRotMap[dpy]->add(layer, *rot);
-        // BWC is not tested for other formats So enable it only for YUV format
-        if(!dpy && isYuvBuffer(hnd))
+        if(!dpy)
             BwcPM::setBwc(crop, dst, transform, mdpFlagsL);
         //Configure rotator for pre-rotation
         if(configRotator(*rot, whf, crop, mdpFlagsL, orient, downscale) < 0) {
